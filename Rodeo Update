@@ -1,0 +1,233 @@
+
+// ==UserScript==
+// @name         CPT Viewer (Rodeo, drift-free & precise)
+// @namespace    https://github.com/<USER>/<REPO>
+// @version      2.4.1
+// @author       yuugurlu
+// @description  Automatische CPT aus Rodeo; präziser Countdown (Computerzeit), Sekunden in letzter Minute
+// @match        https://sortcenter-menu-eu.amazon.com/audit/containerInfo
+// @match        http://sortcenter-menu-eu.amazon.com/audit/containerInfo
+// @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @connect      rodeo-dub.amazon.com
+// @connect      *.amazon.com
+// @run-at       document-end
+// @updateURL    https://raw.githubusercontent.com/<USER>/<REPO>/main/cpt-viewer.user.js
+// @downloadURL  https://raw.githubusercontent.com/<USER>/<REPO>/main/cpt-viewer.user.js
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* 🔧 Konfiguration */
+  const DEFAULT_RODEO_URL = "https://rodeo-dub.amazon.com/SCN2/ExSD?yAxis=WORK_POOL&zAxis=PROCESS_PATH&shipmentTypes=CUSTOMER_SHIPMENTS&exSDRange.quickRange=NEXT_3_DAYS&exSDRange.dailyStart=22%3A30&exSDRange.dailyEnd=15%3A00&giftOption=ALL&fulfillmentServiceClass=ALL&fracs=NON_FRACS&isEulerExSDMiss=ALL&isEulerPromiseMiss=ALL&isEulerUpgraded=ALL&isReactiveTransfer=ALL&workPool=PredictedCharge&workPool=PlannedShipment&_workPool=on&workPool=ReadyToPick&workPool=ReadyToPickHardCapped&workPool=ReadyToPickUnconstrained&workPool=PickingNotYetPicked&workPool=PickingNotYetPickedPrioritized&workPool=PickingNotYetPickedNotPrioritized&workPool=PickingNotYetPickedHardCapped&workPool=CrossdockNotYetPicked&_workPool=on&workPool=PickingPicked&workPool=PickingPickedInProgress&workPool=PickingPickedInTransit&workPool=PickingPickedRouting&workPool=PickingPickedAtDestination&workPool=Inducted&workPool=RebinBuffered&workPool=Sorted&workPool=GiftWrap&workPool=Packing&workPool=Scanned&workPool=ProblemSolving&workPool=ProcessPartial&workPool=SoftwareException&workPool=Crossdock&workPool=PreSort&workPool=TransshipSorted&workPool=Palletized&_workPool=on&workPool=ManifestPending&workPool=ManifestPendingVerification&workPool=Manifested&workPool=Loaded&workPool=TransshipManifested&_workPool=on&processPath=PPAFE1&processPath=PPPickToRebin2&processPath=PPPickToRebin3&processPath=PPPickToRebin4&processPath=PPSingleMedium&processPath=PPSingleNoSLAM&processPath=PPSingleNoSLAM2&processPath=PPSingleWrap&processPath=PPMultiHighUnitCount&processPath=PPAmznPhoto&processPath=PPSingleMedium2&processPath=&minPickPriority=MIN_PRIORITY&shipMethod=&shipOption=&sortCode=&fnSku=";
+  const RODEO_URL_KEY = "cptRodeoUrl";
+  const RODEO_REFRESH_MS = 5 * 60 * 1000; // Rodeo neu laden
+  const GREEN_START_MIN = 25;             // Grün bis CPT-25
+  const GREEN_END_MIN   = 15;             // Rot von CPT-25 bis CPT-15
+  const EPS_MS = 250;                     // Puffer gegen Jitter (ms)
+
+  let rodeoNextCpts = [];    // Array<Date>
+  let currentNextCpt = null; // Date
+  let lastFetchOk = false;
+
+  const monthMap = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+  const pad2 = n => n.toString().padStart(2,"0");
+  const getRodeoUrl = () => localStorage.getItem(RODEO_URL_KEY) || DEFAULT_RODEO_URL;
+  const setRodeoUrl = url => { if(url && url.trim()) localStorage.setItem(RODEO_URL_KEY, url.trim()); };
+
+  window.onload = function () {
+    GM_addStyle(`
+      body { display:flex; flex-direction:column; height:100vh; margin:0; }
+      .top { flex:1; display:flex; flex-direction:column; justify-content:center; align-items:center;
+             background-color:green; color:white; text-align:center; padding:20px; transition:background-color .15s; position:relative; }
+      .top.red { background-color:red !important; }
+      .top.green { background-color:green !important; }
+      .top .actions { position:absolute; right:12px; top:10px; display:flex; gap:10px; font-size:16px; }
+      .top .actions a { color:#fff; cursor:pointer; text-decoration:none; opacity:.9; }
+      .top .actions a:hover { opacity:1; text-decoration:underline; }
+      .bottom { flex:1; background:#f1f1f1 !important; overflow:auto; padding:10px; }
+      h2,h3 { font-size:40px; font-weight:bold; margin:6px 0; }
+      .status { font-size:20px; font-weight:bold; color:black; text-align:center; margin-top:20px; }
+    `);
+
+    // Header/Top
+    const topDiv = document.createElement("div"); topDiv.className = "top";
+    const actions = document.createElement("div"); actions.className = "actions";
+    actions.innerHTML = `<a id="cfgRodeo">⚙️ URL</a><a id="refreshRodeo">↻ Refresh</a>`;
+    topDiv.appendChild(actions);
+
+    const cptElement = document.createElement("h2"); cptElement.id = "cpt"; cptElement.innerText = "Lade CPT...";
+    const remainingElement = document.createElement("h3"); remainingElement.id = "remaining"; remainingElement.innerText = "";
+    const slamPadTimeElement = document.createElement("h3"); slamPadTimeElement.id = "slamPadTime"; slamPadTimeElement.innerText = "";
+
+    topDiv.appendChild(cptElement);
+    topDiv.appendChild(remainingElement);
+    topDiv.appendChild(slamPadTimeElement);
+    document.body.prepend(topDiv);
+
+    // Bottom status
+    const bottomDiv = document.createElement("div");
+    bottomDiv.className = "status"; bottomDiv.id = "processStatus";
+    bottomDiv.innerText = "Lade Prozessstatus...";
+    document.body.appendChild(bottomDiv);
+
+    // UI events
+    document.getElementById("cfgRodeo").addEventListener("click", () => {
+      const cur = getRodeoUrl();
+      const val = prompt("Rodeo-URL für CPT (wird gespeichert):", cur);
+      if (val !== null) { setRodeoUrl(val); fetchRodeoCpts(true); }
+    });
+    document.getElementById("refreshRodeo").addEventListener("click", () => fetchRodeoCpts(true));
+
+    // Start
+    fetchRodeoCpts(true);
+    setInterval(fetchRodeoCpts, RODEO_REFRESH_MS);
+    startTicker(); // drift-frei
+  };
+
+  /** Driftfreier Sekundenticker (Computerzeit) */
+  function startTicker() {
+    function tick() {
+      checkTime();
+      const now = Date.now();
+      const delay = 1000 - (now % 1000);
+      setTimeout(tick, delay);
+    }
+    tick();
+  }
+
+  /** Rodeo laden & CPTs extrahieren */
+  function fetchRodeoCpts(log) {
+    const url = getRodeoUrl();
+    if (log) console.log("🌐 Lade Rodeo:", url);
+
+    GM_xmlhttpRequest({
+      method: "GET",
+      url,
+      onload: function (res) {
+        try {
+          const doc = new DOMParser().parseFromString(res.responseText, "text/html");
+          const ths = doc.querySelectorAll("th.new-day, th.repeat-day");
+          const times = [];
+          let lastDay = null;
+
+          ths.forEach(th => {
+            const label = th.querySelector(".day-label")?.textContent?.trim();
+            if (label) {
+              const [monStr, dayStr] = label.split(/\s+/);
+              const mon = monthMap[monStr?.toLowerCase()];
+              const day = parseInt(dayStr, 10);
+              if (mon !== undefined && !Number.isNaN(day)) {
+                const now = new Date();
+                let y = now.getFullYear();
+                const guess = new Date(y, mon, day);
+                const sixMonths = 183 * 24 * 3600 * 1000;
+                if (Math.abs(guess - now) > sixMonths) y += (guess < now ? 1 : -1);
+                lastDay = { y, m: mon, d: day };
+              }
+            }
+            if (!lastDay) return;
+            const text = th.textContent || "";
+            const re = /(?:^|\s)([01]?\d|2[0-3]):([0-5]\d)(?!\d)/g;
+            let m;
+            while ((m = re.exec(text)) !== null) {
+              const dt = new Date(lastDay.y, lastDay.m, lastDay.d, parseInt(m[1],10), parseInt(m[2],10), 0, 0);
+              times.push(dt);
+            }
+          });
+
+          times.sort((a,b)=>a-b);
+          rodeoNextCpts = times;
+          lastFetchOk = times.length > 0;
+          checkTime();
+        } catch (e) {
+          console.error("❌ Fehler beim Parsen der Rodeo-Seite:", e);
+          lastFetchOk = false; checkTime();
+        }
+      },
+      onerror: function (e) {
+        console.error("❌ Rodeo-Request fehlgeschlagen:", e);
+        lastFetchOk = false; checkTime();
+      }
+    });
+  }
+
+  /** Relevante CPT: jetzt < (CPT − 15 min − EPS) → sonst nächste */
+  function nextRelevantCpt(arr) {
+    const nowMs = Date.now();
+    for (const dt of arr) {
+      const greenEndMs = dt.getTime() - GREEN_END_MIN * 60000;
+      if (nowMs < greenEndMs - EPS_MS) return dt; // noch relevant
+    }
+    return null;
+  }
+
+  /** Countdown-Formatierung mit Epsilon: Minuten floor, letzte Minute Sekunden ceil */
+  function formatCountdown(ms) {
+    if (ms > 60000 - EPS_MS) {
+      const mins = Math.floor((ms + EPS_MS) / 60000); // robust gegen knappe Grenzen
+      return `${mins} Minuten`;
+    } else {
+      const secs = Math.max(0, Math.ceil((ms - (EPS_MS/2)) / 1000)); // Sekunden sauber runden
+      return `${secs} Sekunden`;
+    }
+  }
+
+  /** Anzeige-/Status-Logik (Computerzeit-basiert) */
+  function checkTime() {
+    const nowMs = Date.now();
+
+    const candidate = nextRelevantCpt(rodeoNextCpts);
+    currentNextCpt = candidate || null;
+
+    const cptElement = document.getElementById("cpt");
+    const remainingElement = document.getElementById("remaining");
+    const slamPadTimeElement = document.getElementById("slamPadTime");
+    const processStatusElement = document.getElementById("processStatus");
+    const topDiv = document.querySelector(".top");
+
+    if (!currentNextCpt) {
+      cptElement.innerText = "Keine kommende CPT";
+      remainingElement.innerText = "";
+      slamPadTimeElement.innerText = "";
+      processStatusElement.innerText = lastFetchOk ? "Prozess abgeschlossen" : "Keine CPT gefunden – prüfe Rodeo-URL/Filter";
+      topDiv.classList.add("green"); topDiv.classList.remove("red");
+      return;
+    }
+
+    const cptMs      = currentNextCpt.getTime();
+    const greenStart = cptMs - GREEN_START_MIN * 60000;
+    const greenEnd   = cptMs - GREEN_END_MIN   * 60000;
+    const inGreen    = nowMs >= greenStart + EPS_MS && nowMs < greenEnd - EPS_MS;
+
+    const msToGreenStart = greenStart - nowMs;
+    const msToGreenEnd   = greenEnd   - nowMs;
+
+    // Headline: immer die relevante CPT
+    const cpt = new Date(cptMs);
+    cptElement.innerText = `Nächste CPT: ${pad2(cpt.getHours())}:${pad2(cpt.getMinutes())}`;
+
+    if (inGreen) {
+      remainingElement.innerText = "";
+      slamPadTimeElement.innerText = `Verbleibende Zeit bis Ende Slam Pad Time: ${formatCountdown(msToGreenEnd)}`;
+    } else {
+      slamPadTimeElement.innerText = "";
+      if (msToGreenStart > 0) {
+        remainingElement.innerText = `Verbleibende Zeit bis Start der Slam Pad Time: ${formatCountdown(msToGreenStart)}`;
+      } else {
+        // zwischen Rot-Ende und CPT-15-Schwellwert sollte wegen Relevanzwechsel nicht vorkommen
+        remainingElement.innerText = "";
+      }
+    }
+
+    // Farben & Prozessstatus
+    topDiv.classList.toggle("green", !inGreen);
+    topDiv.classList.toggle("red", inGreen);
+
+    if (nowMs < greenStart - EPS_MS)      processStatusElement.innerText = "Über Conveyor prozessieren";
+    else if (inGreen)                     processStatusElement.innerText = "Über Ship Collect prozessieren";
+    else                                  processStatusElement.innerText = "Prozess abgeschlossen";
+  }
+
+})();
