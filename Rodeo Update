@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         CPT Viewer (Rodeo, drift-free & precise)
 // @namespace    https://github.com/<USER>/<REPO>
-// @version      2.4.1
+// @version      2.4.2
 // @author       yuugurlu
 // @description  Automatische CPT aus Rodeo; präziser Countdown (Computerzeit), Sekunden in letzter Minute
 // @match        https://sortcenter-menu-eu.amazon.com/audit/containerInfo
@@ -15,6 +15,7 @@
 // @updateURL    https://raw.githubusercontent.com/<USER>/<REPO>/main/cpt-viewer.user.js
 // @downloadURL  https://raw.githubusercontent.com/<USER>/<REPO>/main/cpt-viewer.user.js
 // ==/UserScript==
+
 
 (function () {
   'use strict';
